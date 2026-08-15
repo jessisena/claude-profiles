@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# claude-as — run Claude Code under a named account profile
+#
+# Each profile is a directory in CLAUDE_PROFILE_HOME (default ~/.claude-profiles).
+# Setting CLAUDE_CONFIG_DIR scopes credentials, config, and the background-agent
+# daemon to that directory — the default ~/.claude account is never touched.
+#
+# Usage:
+#   claude-as <profile> [claude args...]   run claude under that profile
+#   claude-as --new <name>                 create a profile and sign in
+#   claude-as --list                       list available profiles
+#   claude-as --path <name>                print a profile's config dir
+#   claude-as --help
+
+set -euo pipefail
+
+readonly PROFILE_HOME="${CLAUDE_PROFILE_HOME:-$HOME/.claude-profiles}"
+readonly SCRIPT="${0##*/}"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+die() {
+  printf '%s: %s\n' "$SCRIPT" "$1" >&2
+  exit 1
+}
+
+# Validate a profile name: non-empty, not . or .., only safe characters.
+# Bash 3.2 compatible (no =~, no ${var,,}).
+validate_name() {
+  local name="$1"
+  case "$name" in
+  "" | "." | "..")
+    die "profile name cannot be empty, '.', or '..'"
+    ;;
+  esac
+  case "$name" in
+  *[!A-Za-z0-9._-]*)
+    die "invalid profile name '$name' — use only letters, numbers, dots, hyphens, underscores"
+    ;;
+  esac
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+cmd_help() {
+  cat <<EOF
+usage: $SCRIPT <profile> [claude args...]
+       $SCRIPT --new <name>
+       $SCRIPT --list
+       $SCRIPT --path <name>
+       $SCRIPT --help
+
+Run Claude Code under a named account profile. Each profile is an isolated
+login, config tree, and background-agent supervisor.
+
+Profiles live in: ${CLAUDE_PROFILE_HOME:-\$HOME/.claude-profiles}
+Override with:    CLAUDE_PROFILE_HOME=/other/path $SCRIPT ...
+
+COMMANDS
+  <profile>          start claude under that account (exec — no shell pollution)
+  --new <name>       mkdir the profile and open a sign-in browser tab
+  --list, -l         list available profiles
+  --path <name>      print the profile's CLAUDE_CONFIG_DIR (for scripts)
+  --help, -h         show this help
+
+EXAMPLES
+  $SCRIPT personal                start claude as your personal account
+  $SCRIPT personal auth status    check which account is signed in
+  $SCRIPT personal --resume       resume the last personal session
+  $SCRIPT personal agents         manage background agents for personal
+  $SCRIPT --new work              create the 'work' profile and sign in
+  $SCRIPT --list                  show all profiles
+  $SCRIPT --path personal         print ~/.claude-profiles/personal
+
+See docs/configuring-profiles.md for a full guide.
+EOF
+}
+
+cmd_list() {
+  if [[ ! -d "$PROFILE_HOME" ]]; then
+    printf '(no profiles yet — create one with: %s --new <name>)\n' "$SCRIPT" >&2
+    return 0
+  fi
+  local found=0
+  for d in "$PROFILE_HOME"/*/; do
+    [[ -d "$d" ]] || continue
+    # Print basename only (strip trailing slash, then take last component)
+    local p="${d%/}"
+    printf '%s\n' "${p##*/}"
+    found=1
+  done
+  if [[ $found -eq 0 ]]; then
+    printf '(no profiles yet — create one with: %s --new <name>)\n' "$SCRIPT" >&2
+  fi
+}
+
+cmd_new() {
+  local name="$1"
+  validate_name "$name"
+  local dir="$PROFILE_HOME/$name"
+  if [[ -d "$dir" ]]; then
+    printf '%s: profile already exists — opening sign-in for: %s\n' "$SCRIPT" "$name" >&2
+  else
+    mkdir -p "$dir"
+    printf '%s: created profile %s at %s\n' "$SCRIPT" "$name" "$dir" >&2
+  fi
+  printf '%s: opening browser for sign-in...\n' "$SCRIPT" >&2
+  exec env CLAUDE_CONFIG_DIR="$dir" claude auth login
+}
+
+cmd_path() {
+  local name="$1"
+  validate_name "$name"
+  local dir="$PROFILE_HOME/$name"
+  [[ -d "$dir" ]] || die "unknown profile '$name' — create it with: $SCRIPT --new $name"
+  printf '%s\n' "$dir"
+}
+
+cmd_run() {
+  local name="$1"
+  shift
+  validate_name "$name"
+  local dir="$PROFILE_HOME/$name"
+  if [[ ! -d "$dir" ]]; then
+    die "unknown profile '$name' — create it with: $SCRIPT --new $name"
+  fi
+  # exec replaces this process; CLAUDE_CONFIG_DIR exists only in claude's env.
+  exec env CLAUDE_CONFIG_DIR="$dir" claude "$@"
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+if [[ $# -eq 0 ]]; then
+  cmd_help
+  exit 1
+fi
+
+case "$1" in
+--help | -h)
+  cmd_help
+  ;;
+--list | -l)
+  cmd_list
+  ;;
+--new | -n)
+  [[ $# -ge 2 ]] || die "--new requires a profile name"
+  cmd_new "$2"
+  ;;
+--path | -p)
+  [[ $# -ge 2 ]] || die "--path requires a profile name"
+  cmd_path "$2"
+  ;;
+-*)
+  die "unknown option '$1' (run with --help for usage)"
+  ;;
+*)
+  cmd_run "$@"
+  ;;
+esac
