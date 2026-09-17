@@ -51,12 +51,25 @@ claude-profile-current() {
 
 # Tab-completion for claude-as: first argument is a profile name.
 _claude-as() {
-  local -a profiles
+  local -a profiles skills
   profiles=( "$CLAUDE_PROFILE_HOME"/*(/N:t) )
+  skills=( "${CLAUDE_GLOBAL_SKILLS:-$HOME/.claude/skills}"/*(N:t) )
+
+  # The skill-sharing flags take a list of skill names, so complete those
+  # (plus their own options) for every word after the flag.
+  case "${words[2]}" in
+  --sync-skills | --unsync-skills)
+    compadd -- --all --list --profile "${skills[@]}"
+    return
+    ;;
+  esac
+
   _arguments \
     '(-l --list)'{-l,--list}'[list available profiles]' \
     '(-n --new)'{-n,--new}'[create and sign in to a new profile]:name:' \
     '(-p --path)'{-p,--path}'[print a profile'"'"'s config dir]:profile:($profiles)' \
+    '--sync-skills[share global skills with every profile]' \
+    '--unsync-skills[stop sharing the named skills]' \
     '(-h --help)'{-h,--help}'[show help]' \
     '1:profile:($profiles)' \
     '*::claude args:'

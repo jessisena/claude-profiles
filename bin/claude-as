@@ -10,11 +10,12 @@
 #   claude-as --new <name>                 create a profile and sign in
 #   claude-as --list                       list available profiles
 #   claude-as --path <name>                print a profile's config dir
+#   claude-as --sync-skills [name...]      share global skills with every profile
+#   claude-as --unsync-skills <name...>    stop sharing those skills
 #   claude-as --help
 
 set -euo pipefail
 
-readonly PROFILE_HOME="${CLAUDE_PROFILE_HOME:-$HOME/.claude-profiles}"
 readonly SCRIPT="${0##*/}"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -24,20 +25,260 @@ die() {
   exit 1
 }
 
-# Validate a profile name: non-empty, not . or .., only safe characters.
+# Echo an absolute path with trailing slashes stripped; die if it is relative.
+# Normalizing matters because symlink targets are compared as literal text.
+norm_dir() {
+  local path="$1" label="$2"
+  case "$path" in
+  /*) ;;
+  *) die "$label must be an absolute path, got: $path" ;;
+  esac
+  while [[ "$path" != "/" ]] && [[ "${path%/}" != "$path" ]]; do
+    path="${path%/}"
+  done
+  printf '%s\n' "$path"
+}
+
+PROFILE_HOME="$(norm_dir "${CLAUDE_PROFILE_HOME:-$HOME/.claude-profiles}" CLAUDE_PROFILE_HOME)"
+readonly PROFILE_HOME
+
+# Echo the normalized global skills directory; die if it does not exist.
+# Only the skill-sharing commands call this, so a missing ~/.claude/skills
+# never blocks a plain `claude-as <profile>` run.
+global_skills_dir() {
+  local dir
+  dir="$(norm_dir "${CLAUDE_GLOBAL_SKILLS:-$HOME/.claude/skills}" CLAUDE_GLOBAL_SKILLS)"
+  [[ -d "$dir" ]] || die "global skills dir not found: $dir (override with CLAUDE_GLOBAL_SKILLS)"
+  printf '%s\n' "$dir"
+}
+
+manifest_path() {
+  printf '%s\n' "$PROFILE_HOME/.global-skills"
+}
+
+# Validate a profile name: non-empty, no leading dot, only safe characters.
+# The leading-dot rule keeps profile names from colliding with .global-skills.
 # Bash 3.2 compatible (no =~, no ${var,,}).
 validate_name() {
   local name="$1"
   case "$name" in
-  "" | "." | "..")
-    die "profile name cannot be empty, '.', or '..'"
+  "")
+    die "profile name cannot be empty"
     ;;
-  esac
-  case "$name" in
+  .*)
+    die "profile name cannot start with a dot: '$name'"
+    ;;
   *[!A-Za-z0-9._-]*)
     die "invalid profile name '$name' — use only letters, numbers, dots, hyphens, underscores"
     ;;
   esac
+}
+
+# Validate a skill name. 'synced' is reserved: Claude Code manages
+# <profile>/skills/synced itself and must never be shadowed by a symlink.
+validate_skill_name() {
+  local name="$1"
+  case "$name" in
+  "")
+    die "skill name cannot be empty"
+    ;;
+  .*)
+    die "skill name cannot start with a dot: '$name'"
+    ;;
+  synced)
+    die "'synced' is managed by Claude Code and cannot be shared"
+    ;;
+  *[!A-Za-z0-9._-]*)
+    die "invalid skill name '$name' — use only letters, numbers, dots, hyphens, underscores"
+    ;;
+  esac
+}
+
+# ── manifest ─────────────────────────────────────────────────────────────────
+
+# Print the manifest one entry per line, skipping blanks and # comments.
+# Read via redirect, not a pipe, and tolerate a missing final newline.
+manifest_read() {
+  local file line
+  file="$(manifest_path)"
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+    "" | "#"*) continue ;;
+    esac
+    printf '%s\n' "$line"
+  done <"$file"
+}
+
+# Rewrite the manifest as the sorted, de-duplicated union of itself and "$@".
+manifest_add() {
+  [[ $# -gt 0 ]] || return 0
+  local file tmp
+  file="$(manifest_path)"
+  mkdir -p "$PROFILE_HOME"
+  tmp="$file.tmp.$$"
+  {
+    manifest_read
+    printf '%s\n' "$@"
+  } | sort -u >"$tmp"
+  mv "$tmp" "$file"
+}
+
+# Rewrite the manifest without the entries named in "$@".
+manifest_remove() {
+  [[ $# -gt 0 ]] || return 0
+  local file tmp line entry keep
+  file="$(manifest_path)"
+  [[ -f "$file" ]] || return 0
+  tmp="$file.tmp.$$"
+  : >"$tmp"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    keep=1
+    for entry in "$@"; do
+      if [[ "$line" == "$entry" ]]; then
+        keep=0
+      fi
+    done
+    if [[ $keep -eq 1 ]]; then
+      printf '%s\n' "$line" >>"$tmp"
+    fi
+  done < <(manifest_read)
+  # Drop the file entirely rather than leaving an empty one behind.
+  if [[ -s "$tmp" ]]; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp" "$file"
+  fi
+}
+
+# Echo the global entry for a requested skill: <name>, else <name>.md.
+# rc 1 if neither exists. -L is tested too so dangling links still resolve.
+resolve_global_entry() {
+  local dir="$1" name="$2"
+  if [[ -e "$dir/$name" ]] || [[ -L "$dir/$name" ]]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  if [[ -e "$dir/$name.md" ]] || [[ -L "$dir/$name.md" ]]; then
+    printf '%s\n' "$name.md"
+    return 0
+  fi
+  return 1
+}
+
+# Echo the manifest entry matching a requested name (<name> or <name>.md).
+# Matching against the manifest, not the global dir, so a skill can be
+# unshared after its global copy is already gone. rc 1 if absent.
+resolve_manifest_entry() {
+  local name="$1" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$name" ]] || [[ "$line" == "$name.md" ]]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done < <(manifest_read)
+  return 1
+}
+
+# ── linking ──────────────────────────────────────────────────────────────────
+
+# Link one global skill into one profile.
+# rc 0 linked or already correct, 1 conflict left alone, 2 source missing.
+link_one() {
+  local dir="$1" profile_dir="$2" entry="$3"
+  local source="$dir/$entry" target="$profile_dir/skills/$entry" current=""
+
+  if [[ ! -e "$source" ]] && [[ ! -L "$source" ]]; then
+    printf '  ! %s — not found in %s\n' "$entry" "$dir" >&2
+    return 2
+  fi
+  if [[ -e "$profile_dir/skills" ]] && [[ ! -d "$profile_dir/skills" ]]; then
+    printf '  ! %s — %s/skills is not a directory\n' "$entry" "$profile_dir" >&2
+    return 1
+  fi
+  mkdir -p "$profile_dir/skills"
+
+  # -L before -e: a dangling symlink is -L true but -e false.
+  if [[ -L "$target" ]]; then
+    if current="$(readlink "$target")" && [[ "$current" == "$source" ]]; then
+      printf '  = %s\n' "$entry"
+      return 0
+    fi
+    # rm first: `ln -sf` onto a symlink-to-directory writes *inside* it.
+    rm -f "$target"
+    ln -s "$source" "$target"
+    printf '  + %s (relinked)\n' "$entry"
+    return 0
+  fi
+  if [[ -e "$target" ]]; then
+    printf '  ! %s — profile has its own copy, skipped\n' "$entry" >&2
+    return 1
+  fi
+  ln -s "$source" "$target"
+  printf '  + %s\n' "$entry"
+}
+
+# Remove a symlink this tool created. rc 0 removed or absent, 1 left alone.
+unlink_one() {
+  local dir="$1" profile_dir="$2" entry="$3"
+  local source="$dir/$entry" target="$profile_dir/skills/$entry" current=""
+
+  if [[ ! -e "$target" ]] && [[ ! -L "$target" ]]; then
+    return 0
+  fi
+  if [[ ! -L "$target" ]]; then
+    printf '  ! %s — not a symlink, left alone\n' "$entry" >&2
+    return 1
+  fi
+  if ! current="$(readlink "$target")" || [[ "$current" != "$source" ]]; then
+    printf '  ! %s — points elsewhere, left alone\n' "$entry" >&2
+    return 1
+  fi
+  rm -f "$target"
+  printf '  - %s\n' "$entry"
+}
+
+# Link every manifest entry into one profile. rc = worst link_one rc.
+apply_manifest() {
+  local dir="$1" profile_dir="$2" entry rc=0 one
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    one=0
+    link_one "$dir" "$profile_dir" "$entry" || one=$?
+    if [[ $one -gt $rc ]]; then
+      rc=$one
+    fi
+  done < <(manifest_read)
+  return $rc
+}
+
+# Print profile names, one per line (empty output when there are none).
+list_profiles() {
+  [[ -d "$PROFILE_HOME" ]] || return 0
+  local d p
+  for d in "$PROFILE_HOME"/*/; do
+    [[ -d "$d" ]] || continue
+    p="${d%/}"
+    printf '%s\n' "${p##*/}"
+  done
+}
+
+# Validate a profile name and require that it exists.
+# Never call this inside $(...) — die's exit would only leave the subshell.
+require_profile() {
+  local name="$1"
+  validate_name "$name"
+  [[ -d "$PROFILE_HOME/$name" ]] ||
+    die "unknown profile '$name' — create it with: $SCRIPT --new $name"
+}
+
+# Echo the profiles to act on: one named profile, or every profile.
+target_profiles() {
+  local one="$1"
+  if [[ -n "$one" ]]; then
+    printf '%s\n' "$one"
+    return 0
+  fi
+  list_profiles
 }
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -48,6 +289,8 @@ usage: $SCRIPT <profile> [claude args...]
        $SCRIPT --new <name>
        $SCRIPT --list
        $SCRIPT --path <name>
+       $SCRIPT --sync-skills [--all | --list | --profile <name>] [skill...]
+       $SCRIPT --unsync-skills [--all] [skill...]
        $SCRIPT --help
 
 Run Claude Code under a named account profile. Each profile is an isolated
@@ -61,7 +304,26 @@ COMMANDS
   --new <name>       mkdir the profile and open a sign-in browser tab
   --list, -l         list available profiles
   --path <name>      print the profile's CLAUDE_CONFIG_DIR (for scripts)
-  --help, -h         show this help
+  --sync-skills      share skills from ~/.claude/skills with every profile
+  --unsync-skills    stop sharing the named skills
+  --help, -h         show help
+
+SHARING SKILLS
+  Skills installed globally in ~/.claude/skills are invisible to profiles,
+  because CLAUDE_CONFIG_DIR scopes skill lookup to <profile>/skills. These
+  commands keep a list of chosen skills and symlink each one into every
+  profile. Profile-local skills are never overwritten.
+
+  --sync-skills <skill...>      add those skills to the list, then apply it
+  --sync-skills                 re-apply the list (run after installing a skill)
+  --sync-skills --all           share every skill in ~/.claude/skills
+  --sync-skills --list          print the list, change nothing
+  --sync-skills --profile <p>   apply the list to one profile only
+  --unsync-skills <skill...>    drop those skills and remove their symlinks
+  --unsync-skills --all         drop everything
+
+  The list is shared by all profiles, and new profiles inherit it at --new
+  time. Override the source directory with CLAUDE_GLOBAL_SKILLS.
 
 EXAMPLES
   $SCRIPT personal                start claude as your personal account
@@ -71,38 +333,45 @@ EXAMPLES
   $SCRIPT --new work              create the 'work' profile and sign in
   $SCRIPT --list                  show all profiles
   $SCRIPT --path personal         print ~/.claude-profiles/personal
+  $SCRIPT --sync-skills archify   share one skill with every profile
+  $SCRIPT --sync-skills           re-apply after installing a new skill
+  $SCRIPT --sync-skills --list    show which skills are shared
+  $SCRIPT --unsync-skills archify stop sharing it
 
 See docs/configuring-profiles.md for a full guide.
 EOF
 }
 
 cmd_list() {
-  if [[ ! -d "$PROFILE_HOME" ]]; then
+  local out
+  out="$(list_profiles)"
+  if [[ -z "$out" ]]; then
     printf '(no profiles yet — create one with: %s --new <name>)\n' "$SCRIPT" >&2
     return 0
   fi
-  local found=0
-  for d in "$PROFILE_HOME"/*/; do
-    [[ -d "$d" ]] || continue
-    # Print basename only (strip trailing slash, then take last component)
-    local p="${d%/}"
-    printf '%s\n' "${p##*/}"
-    found=1
-  done
-  if [[ $found -eq 0 ]]; then
-    printf '(no profiles yet — create one with: %s --new <name>)\n' "$SCRIPT" >&2
-  fi
+  printf '%s\n' "$out"
 }
 
 cmd_new() {
-  local name="$1"
+  local name="$1" rc=0 dir skills_dir
   validate_name "$name"
-  local dir="$PROFILE_HOME/$name"
+  dir="$PROFILE_HOME/$name"
   if [[ -d "$dir" ]]; then
     printf '%s: profile already exists — opening sign-in for: %s\n' "$SCRIPT" "$name" >&2
   else
     mkdir -p "$dir"
     printf '%s: created profile %s at %s\n' "$SCRIPT" "$name" "$dir" >&2
+  fi
+  # Inherit shared skills. Never fatal — sign-in must still happen.
+  if [[ -n "$(manifest_read)" ]]; then
+    skills_dir=""
+    if skills_dir="$(global_skills_dir 2>/dev/null)"; then
+      printf '%s: sharing skills with %s\n' "$SCRIPT" "$name" >&2
+      apply_manifest "$skills_dir" "$dir" || rc=$?
+      if [[ $rc -ne 0 ]]; then
+        printf '%s: some skills were not shared (see above)\n' "$SCRIPT" >&2
+      fi
+    fi
   fi
   printf '%s: opening browser for sign-in...\n' "$SCRIPT" >&2
   exec env CLAUDE_CONFIG_DIR="$dir" claude auth login
@@ -110,22 +379,231 @@ cmd_new() {
 
 cmd_path() {
   local name="$1"
-  validate_name "$name"
-  local dir="$PROFILE_HOME/$name"
-  [[ -d "$dir" ]] || die "unknown profile '$name' — create it with: $SCRIPT --new $name"
-  printf '%s\n' "$dir"
+  require_profile "$name"
+  printf '%s\n' "$PROFILE_HOME/$name"
 }
 
 cmd_run() {
   local name="$1"
   shift
-  validate_name "$name"
-  local dir="$PROFILE_HOME/$name"
-  if [[ ! -d "$dir" ]]; then
-    die "unknown profile '$name' — create it with: $SCRIPT --new $name"
-  fi
+  require_profile "$name"
   # exec replaces this process; CLAUDE_CONFIG_DIR exists only in claude's env.
-  exec env CLAUDE_CONFIG_DIR="$dir" claude "$@"
+  exec env CLAUDE_CONFIG_DIR="$PROFILE_HOME/$name" claude "$@"
+}
+
+# ── skill sharing ────────────────────────────────────────────────────────────
+
+# Resolve requested skill names to global entries and add them to the manifest.
+# rc 2 if any name had no match; the rest are still enrolled.
+enroll_names() {
+  local dir="$1"
+  shift
+  local name entry rc=0
+  local resolved=()
+  for name in "$@"; do
+    validate_skill_name "$name"
+    if entry="$(resolve_global_entry "$dir" "$name")"; then
+      resolved+=("$entry")
+    else
+      printf '%s: no such global skill: %s (looked in %s)\n' "$SCRIPT" "$name" "$dir" >&2
+      rc=2
+    fi
+  done
+  if [[ ${#resolved[@]} -gt 0 ]]; then
+    manifest_add "${resolved[@]}"
+  fi
+  return $rc
+}
+
+# Add every shareable entry in the global skills dir to the manifest.
+# The glob skips dotfiles, so .DS_Store is excluded for free.
+enroll_all() {
+  local dir="$1" entry base
+  local found=()
+  for entry in "$dir"/*; do
+    if [[ ! -e "$entry" ]] && [[ ! -L "$entry" ]]; then
+      continue
+    fi
+    base="${entry##*/}"
+    if [[ "$base" == "synced" ]]; then
+      continue
+    fi
+    found+=("$base")
+  done
+  if [[ ${#found[@]} -eq 0 ]]; then
+    printf '%s: no skills found in %s\n' "$SCRIPT" "$dir" >&2
+    return 0
+  fi
+  manifest_add "${found[@]}"
+}
+
+# Apply the manifest to one profile or all of them. rc 2 on any problem.
+sync_apply() {
+  local dir="$1" one_profile="$2" profiles name rc=0 one
+  profiles="$(target_profiles "$one_profile")"
+  if [[ -z "$profiles" ]]; then
+    printf '%s: no profiles yet — list saved, it applies when you create one\n' "$SCRIPT" >&2
+    return 0
+  fi
+  if [[ -z "$(manifest_read)" ]]; then
+    printf '%s: no skills shared yet — add some with: %s --sync-skills <skill...>\n' \
+      "$SCRIPT" "$SCRIPT" >&2
+    return 0
+  fi
+  while IFS= read -r name || [[ -n "$name" ]]; do
+    printf '%s:\n' "$name"
+    one=0
+    apply_manifest "$dir" "$PROFILE_HOME/$name" || one=$?
+    if [[ $one -ne 0 ]]; then
+      rc=2
+    fi
+  done <<EOF
+$profiles
+EOF
+  return $rc
+}
+
+# Remove the named entries from every profile. rc 2 if any were left alone.
+unsync_apply() {
+  local dir="$1"
+  shift
+  local profiles name entry rc=0
+  profiles="$(list_profiles)"
+  [[ -n "$profiles" ]] || return 0
+  while IFS= read -r name || [[ -n "$name" ]]; do
+    printf '%s:\n' "$name"
+    for entry in "$@"; do
+      unlink_one "$dir" "$PROFILE_HOME/$name" "$entry" || rc=2
+    done
+  done <<EOF
+$profiles
+EOF
+  return $rc
+}
+
+cmd_sync_skills() {
+  local do_all=0 do_list=0 one_profile="" skills_dir rc=0 one
+  local names=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --all)
+      do_all=1
+      shift
+      ;;
+    --list)
+      do_list=1
+      shift
+      ;;
+    --profile)
+      [[ $# -ge 2 ]] || die "--profile requires a profile name"
+      one_profile="$2"
+      shift 2
+      ;;
+    --profile=*)
+      one_profile="${1#--profile=}"
+      shift
+      ;;
+    -*)
+      die "unknown option '$1' for --sync-skills"
+      ;;
+    *)
+      names+=("$1")
+      shift
+      ;;
+    esac
+  done
+
+  if [[ $do_list -eq 1 ]]; then
+    if [[ $do_all -eq 1 ]] || [[ ${#names[@]} -gt 0 ]] || [[ -n "$one_profile" ]]; then
+      die "--list takes no other arguments"
+    fi
+    manifest_read
+    return 0
+  fi
+  if [[ $do_all -eq 1 ]] && [[ ${#names[@]} -gt 0 ]]; then
+    die "--all cannot be combined with skill names"
+  fi
+  if [[ -n "$one_profile" ]] && { [[ $do_all -eq 1 ]] || [[ ${#names[@]} -gt 0 ]]; }; then
+    die "--profile cannot add skills — run: $SCRIPT --sync-skills <skill...> first"
+  fi
+
+  if [[ -n "$one_profile" ]]; then
+    require_profile "$one_profile"
+  fi
+
+  skills_dir="$(global_skills_dir)" || exit 1
+  if [[ $do_all -eq 1 ]]; then
+    enroll_all "$skills_dir"
+  elif [[ ${#names[@]} -gt 0 ]]; then
+    one=0
+    enroll_names "$skills_dir" "${names[@]}" || one=$?
+    if [[ $one -ne 0 ]]; then
+      rc=2
+    fi
+  fi
+  one=0
+  sync_apply "$skills_dir" "$one_profile" || one=$?
+  if [[ $one -ne 0 ]]; then
+    rc=2
+  fi
+  return $rc
+}
+
+cmd_unsync_skills() {
+  local do_all=0 skills_dir rc=0 one name entry
+  local names=()
+  local entries=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --all)
+      do_all=1
+      shift
+      ;;
+    -*)
+      die "unknown option '$1' for --unsync-skills"
+      ;;
+    *)
+      names+=("$1")
+      shift
+      ;;
+    esac
+  done
+
+  if [[ $do_all -eq 1 ]] && [[ ${#names[@]} -gt 0 ]]; then
+    die "--all cannot be combined with skill names"
+  fi
+  if [[ $do_all -eq 0 ]] && [[ ${#names[@]} -eq 0 ]]; then
+    die "--unsync-skills requires skill names (or --all)"
+  fi
+
+  skills_dir="$(global_skills_dir)" || exit 1
+  if [[ $do_all -eq 1 ]]; then
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+      entries+=("$entry")
+    done < <(manifest_read)
+  else
+    for name in "${names[@]}"; do
+      validate_skill_name "$name"
+      if entry="$(resolve_manifest_entry "$name")"; then
+        entries+=("$entry")
+      else
+        printf '%s: %s is not currently shared\n' "$SCRIPT" "$name" >&2
+        rc=2
+      fi
+    done
+  fi
+
+  if [[ ${#entries[@]} -eq 0 ]]; then
+    printf '%s: nothing to unshare\n' "$SCRIPT" >&2
+    return $rc
+  fi
+  one=0
+  unsync_apply "$skills_dir" "${entries[@]}" || one=$?
+  if [[ $one -ne 0 ]]; then
+    rc=2
+  fi
+  manifest_remove "${entries[@]}"
+  return $rc
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -134,6 +612,8 @@ if [[ $# -eq 0 ]]; then
   cmd_help
   exit 1
 fi
+
+MAIN_RC=0
 
 case "$1" in
 --help | -h)
@@ -149,6 +629,16 @@ case "$1" in
 --path | -p)
   [[ $# -ge 2 ]] || die "--path requires a profile name"
   cmd_path "$2"
+  ;;
+--sync-skills)
+  shift
+  cmd_sync_skills "$@" || MAIN_RC=$?
+  exit $MAIN_RC
+  ;;
+--unsync-skills)
+  shift
+  cmd_unsync_skills "$@" || MAIN_RC=$?
+  exit $MAIN_RC
   ;;
 -*)
   die "unknown option '$1' (run with --help for usage)"

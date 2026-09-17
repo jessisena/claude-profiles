@@ -80,8 +80,13 @@ Each profile directory (`CLAUDE_CONFIG_DIR`) is isolated in:
 - **Background agents** — separate daemon socket, separate `tasks/`
 
 There is no implicit sharing. A new profile starts completely empty and runs onboarding
-once (theme selection, trust prompts). To share skills or config, symlink them manually —
-see `configuring-profiles.md`.
+once (theme selection, trust prompts).
+
+Skills are the one opt-in exception: `claude-as --sync-skills` keeps a list of chosen skills
+in `$CLAUDE_PROFILE_HOME/.global-skills` and symlinks each one from `~/.claude/skills` into
+every profile's `skills/`. Per-skill links, not a whole-directory link, so Claude Code's
+managed `skills/synced/` bucket and any profile-local skill survive. Any other config is
+symlinked manually — see `configuring-profiles.md`.
 
 ## Why `exec env VAR=value claude`, not `export VAR`
 

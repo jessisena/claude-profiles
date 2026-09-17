@@ -51,6 +51,33 @@ Every argument after the profile name is forwarded verbatim to `claude`.
 
 Two profiles can run in parallel — each has its own Keychain item and daemon socket.
 
+## Sharing global skills
+
+Skills in `~/.claude/skills` are invisible to profiles. Pick the ones you want everywhere:
+
+```sh
+claude-as --sync-skills pr-description  # share it with every profile
+claude-as --sync-skills                 # re-apply after installing a new skill
+claude-as --sync-skills --all           # share everything
+claude-as --sync-skills --list          # show what is shared
+claude-as --unsync-skills pr-description
+```
+
+Each skill is linked individually, so profile-local skills and Claude Code's managed
+`synced/` directory are never touched. New profiles inherit the list automatically.
+
+## Updating
+
+`claude-as` is symlinked into `~/.local/bin`, so a pull is the whole update:
+
+```sh
+cd ~/github/claude-profiles && git pull
+exec zsh                                # only to refresh completions
+```
+
+Re-running `./install.sh` is not needed. See
+[docs/configuring-profiles.md](docs/configuring-profiles.md#updating-an-existing-install).
+
 ## Shell-level switching (zsh, optional)
 
 After `./install.sh --with-zsh`:
